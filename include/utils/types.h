@@ -1,5 +1,5 @@
 /*
-各个点云类型的别名定义，方便后续修改和使用
+各个点云类型的别名定义，和imu信息，方便后续修改和使用
 
 */
 
@@ -37,7 +37,7 @@ typedef Eigen::Matrix3d M3D;
 //某个imu时间段内的位姿信息，对应lidar预积分状态
 struct Pose6D
 {
-    double offset_time;   //imu的测量时间相对于liadr的第一个点云的时间偏移，单位为秒
+    double offset_time;   //    imu的测量时间相对于liadr的第一个点云的时间偏移，单位为秒
     double acc[3];     //加速度，单位为m/s^2
     double gyr[3];    //陀螺仪，单位为rad/s
     double vel[3];    //速度，单位为m/s
