@@ -21,10 +21,10 @@ using namespace std;
 enum LiDARFeature
 {
   Nor = 1,   //普通点
-  Poss_plane,   //可能是平面点
-  real_plane,    //真实平面点
+  Poss_plane,   //可能是平面
+  real_plane,    //真实平面
   Edge_Jump,   //跳变边缘点
-  Edge_Plane,   //平面边缘点
+  Edge_Plane,   //边缘平面
   Wire,         //线状特征
   ZeroPoint     //无效点
 };
