@@ -3,6 +3,7 @@ imu初始化
 */
 
 #include"IMU_Processing.h"
+#include <type_traits>
 
 
 //时间序列比较
@@ -11,7 +12,7 @@ const bool time_list(PointType &x, PointType &y)
     return (x.curvature < y.curvature);
 }
 
-//imu数据的初始化
+//imu模块的初始化
 ImuProcess::ImuProcess() : Eye3d(M3D::Identity()), Zero3d(0,0,0), b_first_frame(true), imu_need_init(true)
 {
     init_iter_num = 1;                 //初始化迭代次数为1
@@ -63,12 +64,16 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &start, Poi
             return;
         };
 
+        //imu初始化，init_iter_num是开始帧，一般是1
         imu_init(meas, stat, init_iter_num);
 
+        //保持初始化标识
         imu_need_init = true;
 
+        //保存最后一帧imu，保持与上次imu递推状态连续
         last_imu = meas.imu.back();
 
+        //当初始化帧数大于最大初始化帧数退出初始化
         if(init_iter_num > MAX_INI_COUNT)
         {
             imu_need_init = false;
@@ -89,23 +94,13 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &start, Poi
         }
     }
 
+    //去畸变处理
     UndistorPcl(lidar_meas, stat, *cur_pcl_un_)
 
 }
 
-void ImuProcess::Reset()
-{
-    ROS_WARN("Reset IMUProcess");
-    mean_acc = V3D(0, 0, -1.0);
-    mean_gyr = V3D(0, 0, 0);
-    angvel_last = Zero3d;
-    init_iter_num = 1;
 
-    IMUpose.clear();
-    last_imu.reset(new sensor_msgs::Imu());
-    cur_pcl_un_.reset(new PointCloudXYZI());
-}
-
+//imu初始化
 ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, int &N )
 {
     ROS_INFO("IMU Initializing : %.1f %%", double(N) / MAX_INI_COUNT * 100);
@@ -157,5 +152,173 @@ ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, int &N 
     state_inout.bias_g = Zero3d;    //初始化陀螺仪
 
     last_imu = meas.imu.back();   //保存最后一条imu数据，为了下次imu积分能接上
+
+}
+
+//imu状态清楚，防止历史数据污染当前初始化
+void ImuProcess::Reset()
+{
+    ROS_WARN("Reset IMUProcess");
+    mean_acc = V3D(0, 0, -1.0);
+    mean_gyr = V3D(0, 0, 0);
+    angvel_last = Zero3d;
+    init_iter_num = 1;
+
+    IMUpose.clear();
+    last_imu.reset(new sensor_msgs::Imu());
+    cur_pcl_un_.reset(new PointCloudXYZI());
+}
+
+//禁用imu
+void ImuProcess::disable_imu()
+{
+    count << "IMU disabled " << endl;
+    imu_en = false;
+    imu_need_init = false;
+}
+
+//禁用重力在线估计功能
+void ImuProcess::disable_gravity_est()
+{
+    count <<"online Gravity Estiamtion Disable !" <<endl;
+    gravity_est_en = false;
+}
+
+//禁用imu的噪声偏差估计
+void ImuProcess::disable_bias_est()
+{
+    count <<" bias estimation Disable !" << endl;
+    ba_bg_est_en = false;
+}
+
+//禁用在线曝光估计
+void ImuProcess::disable_exposure_est()
+{
+    count <<"online time offset estimation disable !" << endl;
+    exposure_estimate_en = false;
+}
+
+//旋转矩阵设置imu到lidar的外参，    matrix.block<行数, 列数>(起始行, 起始列)
+void ImuProcess::set_extrinsic(const MD(4,4) &T)
+{
+    Lid_offset_to_IMU = T.block<3,1>(0,3);
+    Lid_rot_to_IMU = T.block<3,3>(0,0);
+}
+
+//设置外参平移和旋转
+void ImuProcess::set_extrinsic(const V3D &transl, const M3D &rot)
+{
+    Lid_offset_to_IMU = transl;
+    Lid_rot_to_IMU = rot;
+}
+
+//设置外参平移
+void ImuProcess::set_extrinsic(const V3D &transl )
+{
+    Lid_offset_to_IMU = transl;
+    Lid_rot_to_IMU.Identity();
+}
+
+//设置角速度协方差因子
+void ImuProcess::set_gyr_cov_scale(const V3D &scaler)
+{
+    cov_gyr = scaler;
+}
+
+//加速度协方差因子
+void ImuProcess::set_acc_cov_scale(const V3D &scaler)
+{
+    cov_acc = scaler;
+}
+
+//角速度偏差协方差
+void ImuProcess::set_gyr_bias_cov(const V3D &b_g)
+{
+    cov_bias_gyr = b_g;
+}
+
+//加速度偏置协方差
+void ImuProcess::set_acc_bias_cov(const V3D &b_a)
+{
+    cov_bias_acc = b_a;
+}
+
+//逆曝光时间协方差
+void ImuProcess::set_inv_expo_cov(const double &inv_expo)
+{
+    cov_inv_expo = inv_expo;
+}
+
+//imu初始化帧数
+void ImuProcess::set_imu_init_frame_num(const int &num)
+{
+    MAX_INI_COUNT = num;
+}
+
+
+//imu异常时抛弃imu时用原点云暂时递推
+void ImuProcess::Forward_without_imu(LidarMeasureGroup &meas, StatesGroup &state_inout, PointCloudXYZI &pcl_out)
+{
+    //点云
+    pcl_out = *(meas.lidar);
+
+    //点云开始采样时间
+    const double &pcl_beg_time = meas.lidar_frame_beg_time;
+ 
+    //按帧中点云偏移时间排序
+    sort(pcl_out.point.begin(),  pcl_out.point.end(), time_list);
+
+    //点云结束时间
+    const double &pcl_end_time = pcl_beg_time + pcl_out.point.back().curvature / double(1000);
+
+    //这一帧结束采样的时间
+    meas.last_lio_update_time = pcl_end_time;
+
+    //最后一个点相对帧开始的时间差
+    const double &pcl_end_offset_time = pcl_out.points.back().curvature / double(1000);
+
+    //状态
+    MD(DIM_STATE,DIM_STATE) F_x, cov_w;
+
+    double dt = 0;
+
+    if(b_first_frame)
+    {
+        dt = 0.1;
+        b_first_frame = false;
+    }
+    else
+    {
+        dt = pcl_beg_time - time_last_scan;
+    }
+
+    //更新上一帧开始时间
+    time_last_scan = pcl_beg_time;
+
+    //计算旋转增量
+    M3D Exp_f = Exp(state_inout.bias_g, dt);
+
+    //状态传播
+    F_x.setIdentity();            //状态转移矩阵初始化为单位阵
+    cov_w.setZero();              //状态协方差初始化为零矩阵
+
+    //下一时刻姿态误差 对 上一时刻姿态误差 的传播关系。
+    F_x.block<3,3>(0,0) = Exp(state_inout.bias_g, -dt);
+    F_X.block<3,3>(0,10) = Eye3d * dt;
+    F_x.block<3,3>(3,7) = Eye3d * dt;
+
+    cov_w.block<3,3>(10,10).diagonal() = cov_gyr * dt * dt;
+    cov_w.block<3,3>(7,7).diagonal() = cov_acc * dt * dt;
+
+    //协方差更新
+    state_inout.cov = F_x * state_inout.cov * F_x.transpose() + cov_w;
+
+    //旋转和位置更新
+    state_inout.rot_end = state_inout.rot_end * Exp_f;
+    state_inout.pos_end = state_inout.pos_end * state_inout.vel_end * dt;
+
+
+
+
 
 }
