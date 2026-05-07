@@ -3,6 +3,7 @@ imu初始化
 */
 
 #include"IMU_Processing.h"
+#include <iterator>
 #include <type_traits>
 
 
@@ -289,7 +290,7 @@ void ImuProcess::Forward_without_imu(LidarMeasureGroup &meas, StatesGroup &state
     }
     else
     {
-        dt = pcl_beg_time - time_last_scan;
+     dt = pcl_beg_time - time_last_scan;
     }
 
     //更新上一帧开始时间
@@ -307,6 +308,7 @@ void ImuProcess::Forward_without_imu(LidarMeasureGroup &meas, StatesGroup &state
     F_X.block<3,3>(0,10) = Eye3d * dt;
     F_x.block<3,3>(3,7) = Eye3d * dt;
 
+    //diagonal（）表示取对角线
     cov_w.block<3,3>(10,10).diagonal() = cov_gyr * dt * dt;
     cov_w.block<3,3>(7,7).diagonal() = cov_acc * dt * dt;
 
@@ -316,6 +318,172 @@ void ImuProcess::Forward_without_imu(LidarMeasureGroup &meas, StatesGroup &state
     //旋转和位置更新
     state_inout.rot_end = state_inout.rot_end * Exp_f;
     state_inout.pos_end = state_inout.pos_end * state_inout.vel_end * dt;
+
+    //去畸变
+    if(lidar_type != L515 )
+    {
+        auto it_pcl = pcl_out.point.end() - 1;
+        double dt_j = 0.0;
+        for(;it_pcl != pcl_out.point.std::begin(); it_pcl--)
+        {
+            //确定偏移时间转换为秒
+            dt_j = pcl_end_offset_time - it_pcl->curvature/double(1000);
+
+            //j到k时间的相对旋转，负号表示往前递推
+            M3D R_jk(Exp(state_inout.bias_g, -dt_j));
+
+            //当前点坐标
+            V3D P_j(it_pcl->x,it_pcl->y,it_pcl->z );
+
+            //j到k时间的平移，transpose是坐标系转换到当前坐标系下
+            V3D p_jk;
+            p_jk = - state_inout.rot_end.transpose() * state_inout.vel_end * dt_j;
+
+            //使用平移旋转确定畸变，去畸变点 = 旋转补偿 * 原始点 + 平移补偿
+            V3D P_compensate = R_jk * p_j + p_jk;
+
+            it_pcl->x = P_compensate(0);
+            it_pcl->y = P_compensate(1);
+            it_pcl->z = P_compensate(2)
+        }
+    }
+
+
+    void ImuProcess::UndistorPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_inout, PointCloudXYZI &pcl_out)
+    {
+        double t0 = omp_get_wtime();
+        pcl_out.clear();
+
+        //取当前待处理的一组
+        MeasureGroup &meas = lidar_meas.measures.back();
+
+        //将imu放进新容器并上一帧最后一个imu放入前当前imu开头递推连续
+        auto v_imu = meas.imu;
+        v_imu = push_front(last_imu);
+
+        //确定时间
+        const double &imu_beg_time = v_imu.front()->header.stamp.toSec();
+        const double &imu_end_time = v_imu.back()->header.stamp.toSec();
+        const double prop_beg_time = last_prop_end_time;
+
+        //最后时间取决于本次lio还是vio
+        const double prop_end_time = lidar_meas.lio_vio_flg == LIO ? meas.lio_time : meas.vio_time;
+
+        if(lidar_meas.lio_vio_flg == LIO)
+        {
+            pcl_wait_proc.resize(lidar_meas.pcl_proc_cur->point.size());
+            pcl_wait_proc = *(pcl_meas.pcl_proc_cur);
+            lidar_meas.lidar_scan_index_now = 0;
+            IMUpose.push_back(set_pose6d( 0.0, acc_s_last, angvel_last, state_inout.vel_end, state_inout.pos_end, state_inout.rot_end));
+        }
+
+        //初始化传播变量
+        V3D acc_imu(acc_s_last) , angvel_avr(angvel_last), acc_avr, vel_imu(state_inout.vel_end), pose_imu(state_inout.pos_end);
+        M3D R_imu(state_inout.rot_end);
+        
+        MD(DIM_STATE, DIM_STATE) F_x, cov_w;
+        double dt, dt_all = 0.0;
+
+        //offs_t代表当前积分结束点当对于prop_beg的时间
+        double offs_t;
+
+        double tau;
+        
+        if(!imu_time_init)
+        {
+            tau = 1.0;
+            imu_time_init = true;
+        }
+        else{
+            tau = state_inout.inv_expo_time;
+        }
+
+        switch(lidar_meas.lio_vio_flg)
+        {
+            case LIO;
+
+            case VIO: 
+
+              //dt表示head到tail的积分时间
+              dt = 0;
+              for (int i = 0; i < v_imu.size() - 1; i++)
+              {
+                auto head = v_imu[i];
+                auto tail = v_imu[i+1];
+
+                //跳过传播前无效数据
+                if (tail->header.stamp.toSec() < prop_beg_time ) continue;
+
+                //计算平均角速度
+                angvel_avr << 0.5 * (head->angular_velocity.x + tail->angular_velocity.x), 0.5 * (head->angular_velocity.y + tail->angular_velocity.y),
+                      0.5 * (head->angular_velocity.z + tail->angular_velocity.z)
+
+                //计算平均加速度
+                acc_avr  << 0.5 * (head->linear_acceleration.x + tail->linear_acceleration.x) + 0.5 * (head->linear_acceleration.y + tail->linear_acceleration.y) , 
+                      0.5 * (head->linear_acceleration.z + tail->linear_acceleration.z)
+
+
+                //setw（10）即如果实际数字长度不够 10 个字符，前面会自动补空格，让输出更整齐。  打印imu时间戳，平均加速度，平均角速度    
+                fout_imu << setw(10) << head->header.stamp.toSec() - frist_lidar_time <<  " " << angvel_avr.transpose()  << "  " << acc_var.transpose() << endl;
+
+                //去除偏置
+                angvel_avr -= state_inout.bias_g;
+                acc_var = acc_var * G_m_s2 / mean_acc.norm() - state_inout.bias_a;
+
+                //第一条数据在传播之前
+                if(head->header.stamp.toSec() < prop_beg_time)
+                {
+                    dt = tail->header.stamp.toSec() - last_prop_end_time;
+                    offs_t = tail->header.stamp.toSec() - prop_beg_time;
+                }
+                //当前imu数据在传播区间
+                else if (i != v_imu.size() - 2)
+                {
+
+                    dt = tail->header.stamp.toSec() - head->header.stamp.toSec();
+                    offs_t = tail->header.stamp.toSec() - prop_beg_time;
+                }
+                //当前数据在传播区间且是最后一条imu数据
+                else
+                {
+                    dt = tail->header.stamp.toSec() - head->header.stamp.toSec();
+                    offs_t = prop_end_time - prop_beg_time;
+                }
+
+                dt_all += dt;
+
+                M3D acc_avr_skew;
+                M3D Exp_f = Exp(angvel_avr, dt);
+                acc_avr_skew << SKEW_SYM_MATRX(acc_avr);
+
+                F_x.setIdentity();
+                cov_w.setZero();
+
+                F_x.bolck<3,3>(0,0) = Exp(angvel_var, -dt);
+                F_x.block<3,3>(3,7) = Eye3d * dt;
+
+                if(ba_bg_est_en)
+                {
+                    F_x.block<3,3>(0,10) = -Eye3d * dt;
+                    F_x.block<3,3>(7,13) = -R_imu * dt;
+                }
+
+                if(gravity_est_en)
+                {
+                    F_x.block<3,3>(7,16) = Eye3d * dt;
+                }
+                
+                if(exposure_estimate_en)
+                {
+                    cov_w(6,6) = cov_inv_expo * dt *dt;
+                }
+
+
+              }
+        }
+
+    }
+    
 
 
 
