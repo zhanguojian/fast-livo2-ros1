@@ -4,6 +4,7 @@ imu初始化
 
 #include"IMU_Processing.h"
 #include <iterator>
+#include <system_error>
 #include <type_traits>
 
 
@@ -369,6 +370,7 @@ void ImuProcess::Forward_without_imu(LidarMeasureGroup &meas, StatesGroup &state
         //最后时间取决于本次lio还是vio
         const double prop_end_time = lidar_meas.lio_vio_flg == LIO ? meas.lio_time : meas.vio_time;
 
+        //如果是lio则准备待去畸变的点云
         if(lidar_meas.lio_vio_flg == LIO)
         {
             pcl_wait_proc.resize(lidar_meas.pcl_proc_cur->point.size());
@@ -387,8 +389,10 @@ void ImuProcess::Forward_without_imu(LidarMeasureGroup &meas, StatesGroup &state
         //offs_t代表当前积分结束点当对于prop_beg的时间
         double offs_t;
 
+        //曝光参数
         double tau;
-        
+
+        //如果未初始化
         if(!imu_time_init)
         {
             tau = 1.0;
@@ -398,14 +402,16 @@ void ImuProcess::Forward_without_imu(LidarMeasureGroup &meas, StatesGroup &state
             tau = state_inout.inv_expo_time;
         }
 
+        //如果是vio则把imu递推到vio时间
         switch(lidar_meas.lio_vio_flg)
         {
-            case LIO;
+            case LIO:
 
             case VIO: 
 
               //dt表示head到tail的积分时间
               dt = 0;
+
               for (int i = 0; i < v_imu.size() - 1; i++)
               {
                 auto head = v_imu[i];
@@ -428,9 +434,12 @@ void ImuProcess::Forward_without_imu(LidarMeasureGroup &meas, StatesGroup &state
 
                 //去除偏置
                 angvel_avr -= state_inout.bias_g;
-                acc_var = acc_var * G_m_s2 / mean_acc.norm() - state_inout.bias_a;
+                acc_avr = acc_var * G_m_s2 / mean_acc.norm() - state_inout.bias_a;
 
-                //第一条数据在传播之前
+                
+                //这一段解决IMU 离散时间戳和 LiDAR 帧起止时间不完全对齐的问题。
+
+                //第一条数据在传播之前IMU 离散时间戳和 LiDAR 帧起止时间不完全对齐的问题。
                 if(head->header.stamp.toSec() < prop_beg_time)
                 {
                     dt = tail->header.stamp.toSec() - last_prop_end_time;
@@ -459,6 +468,7 @@ void ImuProcess::Forward_without_imu(LidarMeasureGroup &meas, StatesGroup &state
                 F_x.setIdentity();
                 cov_w.setZero();
 
+                //状态矩阵更新
                 F_x.bolck<3,3>(0,0) = Exp(angvel_var, -dt);
                 F_x.block<3,3>(3,7) = Eye3d * dt;
 
@@ -478,10 +488,89 @@ void ImuProcess::Forward_without_imu(LidarMeasureGroup &meas, StatesGroup &state
                     cov_w(6,6) = cov_inv_expo * dt *dt;
                 }
 
+                //协方差更新
+                cov_w.block<3,3>(0,0).diagonal() = cov_inv_expo * dt *dt;
+                cov_w.block<3,3>(7,7) = R_imu * cov_acc.asDiagonal() * R_imu.transpose() * dt *dt;
+                cov_w.block<3,3>(10,10).diagonal()  = cov_bias_gyr * dt * dt ;
+                cov_w.block<3,3>(13,13).diagonal()  = cov_bias_acc * dt *dt ;
 
+                //协方差递推
+                state_inout.cov = F_x * state_inout * F_x.transpose() + cov_w;
+
+
+                //递推dt的状态得到imu的位姿
+                R_imu = R_imu * Exp_f;
+                acc_imu = R_imu * acc_avr + state_inout.gravity;
+                pos_imu = pos_imu + vel_imu * dt + 0.5 * acc_imu * dt *dt;
+                vel_imu = vel_imu + acc_imu * dt;
+                angvel_last = angvel_avr;
+                acc_s_last = acc_imu;
+
+                IMUpose.push_back(set_pose6d(offs_t, acc_imu, angvel_avr, vel_imu, pose_imu, R_imu));
               }
+
+              lidar_meas.last_lio_update_time = prop_end_time;
+
+              break;
+
         }
 
+        state_inout.vel_end = vel_imu;
+        state_inout.rot_end = R_imu;
+        state_inout.pos_end = pos_imu;
+        state_inout.inv_expo_time = tau;
+
+        last_imu = v_imu.back();
+        last_prop_end_time = prop_end_time;
+
+        double t1 = omp_get_wtime();
+ 
+
+        if(pcl_wait_proc.points.size()<1)  return;
+
+        //如果是lio则将准备的点云去畸变
+        if(lidar_meas.lio_vio_flg == LIO)
+        {
+            auto it_pcl = pcl_wait_proc.points.end() - 1;
+            M3D extR_Ri(Lid_rot_to_IMU.transpose() * state_inout.rot_end.transpose());
+            V3D extR_extT(Lid_rot_to_IMU.transpose() * Lid_offset_to_IMU);
+
+            for( auto it_kp = IMUpose.end() - 1; it_kp != IMUpose.std::begin(); it_kp--)
+            {
+                auto head = it_kp -1;
+                auto tail = it_kp;
+
+                R_imu << MAT_FROM_ARRLY(head->rot);
+                acc_imu << VEC_FROM_ARRLY(head->acc);
+                vel_imu << VEC_FROM_ARRLY(head->vel);
+                pos_imu << VEC_FROM_ARRLY(head->pos);
+                angvel_avr << VEC_FROM_ARRLY(head->gyr);
+            }
+
+
+            //imu递推去畸变
+            for(; it_pcl->curvature/double(1000) > head->offset_time; it--)
+            {
+                dt = it_pcl->curvature / double(1000) - head->offset_time;
+
+                M3D R_i(R_imu * Exp(angvel_avr, dt));
+                V3D T_ei(pos_imu + vel_imu * dt + 0.5 * acc_imu * dy * dt - state_inout.pos_end);
+                V3D P_i(it_pcl->x, it_pcl-y; it_pcl->z);
+
+                V3D P_compensate = (extR_Ri * (R_i * (Lid_rot_to_IMU * P_i + Lid_offset_to_IMU) + T_ei) - exrR_extT);
+
+                it_pcl->x = P_compensate(0);
+                it_pcl->y = P_compensate(1);
+                it_pcl->z = P_compensate(2);
+
+                if(it_pcl == pcl_wait_proc.points.begin()) break;
+            }
+        }
+
+        pcl_out = pcl_wait_proc;
+        pcl_wait_proc.clear();
+        IMUpose.clear();
+        
     }
     
 

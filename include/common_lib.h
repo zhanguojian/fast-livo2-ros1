@@ -27,8 +27,8 @@ using namespace sophus;
 #define SIZE_LARGE (500)    //最大数量500
 #define SIZE_SMALL (100)     //最小数量100
 
-#define VEC_FEOM_APPLY(v) v[0],v[1],v[2]
-#define MAT_FROM_APPLY(v) v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8]
+#define VEC_FEOM_ARRAY(v) v[0],v[1],v[2]
+#define MAT_FROM_ARRAY(v) v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8]
 #define DEBUG_FILE_DIR(name) (string(string(ROOT_DIR) + "log/" +name))
 
 //lidar类型
