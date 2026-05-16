@@ -46,7 +46,6 @@ class ImuProcess
       void set_acc_cov_scale(const V3D &scaler);   //加速度计测量噪声
       void set_gyr_bias_cov(const V3D &b_g);        //陀螺仪游走噪声
       void set_acc_bias_cov(const V3D &b_a);         //加速度计游走噪声
-      
       void set_inv_expo_cov(const double &inv_expo);     //曝光噪声
 
       void set_imu_init_frame_num(const int &num);  //设置初始化帧数

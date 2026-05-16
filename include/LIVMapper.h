@@ -191,6 +191,7 @@ class LIVMapper
 
       ofstream fout_pre, fout_out, fout_pcd_pos, fout_point;
 
+      //定义体素滤波器对象
       pcl::VoxelGrid<PointType> downSizeFilterSurf;
 
       V3D euler_cur;

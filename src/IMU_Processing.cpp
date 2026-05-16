@@ -350,6 +350,7 @@ void ImuProcess::Forward_without_imu(LidarMeasureGroup &meas, StatesGroup &state
     }
 
 
+    //进行imu的递推如果是lio加去畸变
     void ImuProcess::UndistorPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_inout, PointCloudXYZI &pcl_out)
     {
         double t0 = omp_get_wtime();

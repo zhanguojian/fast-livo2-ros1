@@ -105,7 +105,7 @@ void Preprocess::avia_handler(const livox_ros_driver::CustomMsg::ConstPtr &msg)
         pl_buff[i].clear();
         pl_buff[i].reserve(plsize);
     }
-    uint valid_num = 0;
+    uint valid_num = 0;    //有效点后续做降采样
 
 
     if (feature_enabled)
