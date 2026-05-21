@@ -1,5 +1,9 @@
 #include "../include/voxel_map.h"
+#include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <vector>
 
 
@@ -530,7 +534,14 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
         V3D point_this(feats_down_body_->points[i].x, feats_down_body_->points[i].y, feats_down_body_->points[i].z):
 
         //如果z轴坐标为0赋值避免0的计算
-        if(point_this[2] == 0)
+        
+            //把机体坐标系下点转到世界坐标系下
+            V3D point_world = state_propagat.rot_end * point_this + state_propagat.pos_end;
+
+            //构造点到平面残差对平面参数的雅可比 J_nq，对应 r = n^T (p_w - q)
+            Eigen::Matrix<double, 1, 6> J_nq;
+            J_nq.block<1,3>(0,0) = point_world - ptpl_list_[i].center_;
+            J_nq.block<1,3>(0,3) = -ptpl_list_[i].normal_;if(point_this[2] == 0)
         {
             point_this[2] == 0.001;
         }
@@ -610,277 +621,589 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
             //同时保存 body 系下原始协方差。
             pv.body_var = body_cov_list_[i];
         }
+
+        //输出残差计算点云结果历史清空
         ptpl_list_.clear();
 
+        //进行残差计算
         BuildResidualListOMP(pv_list, ptpl_list);
 
+        //累积每个点云计算残杀
         for(int i = 0; i < ptpl_list_.size(); i++)
         {
             total_residual += fabs(ptpl_list_[i].dis_to_plane_);
         }
 
-        //
+        //成功匹配后的点云数
         effect_feat_num_ = ptpl_list_.size();
+
+        //打印采集点云数， 降采样点云数， 有点匹配计算点云数， 这帧点云平均残差
         cout << "[LIO] Raw feature num:" << feats_undistort_->size() << "downsampled feature num:" << feats_down_size_ 
              << "effecture feature num:" << effect_feat_num_ << " average residual:" << total_residual / effect_feat_num_ << endl;
 
 
-    }
 
-    //
-    void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, std::vector<PointToPlane> &ptpl_list)
-    {
-        //获取最大层数
-        int max_layer = config_setting.max_layer_;
 
-        //获取最大体素大小
-        double voxel_size = config_setting_.max_voxel_size_;
 
-        //标准差阈值
-        double sigma_num = config_setting_.sigma_num_;
-        std::mutex mylock();
 
-        //初始化输出结果
-        ptpl_list.clear();
+        // 把“点到平面的距离误差”写成对状态的小量修正的线性函数，
+        //最终得到r≈Hδx+n的形式，其中 H 是测量雅可比矩阵，δx 是状态误差，n 是测量噪声。
 
-        //存储计算得到的残差
-        std::vector<PointToPlane> all_ptpl_list(pv_list.size());
 
-        //标记成功计算了残差的点
-        std::vector<bool> useful_ptpl(pv_list.size());
+        //残差对状态增量的雅可比矩阵，如果位姿稍微动一下，每个距离误差会怎么变化。
+        MatrixXd Husub(effect_feat_num_, 6);
 
-        //记录点的索引
-        std::vector<size_t> index(pv_list.size());
+        //后续构造加权更新方程
+        MatrixXd Husub_T_R_inv(6, effect_feat_num_);
 
-        //初始化有用点标记
-        for(size_t i = 0; i < index.size(); ++i)
+        //每个残差测量噪声方差的倒数，存每个残差的权重，每个距离误差有多可信。
+        vectorXd R_inv(effect_feat_num_);
+
+        //距离误差，存残差值
+        vectorXd meas_vec(effect_feat_num_);
+        meas_vec.setZero();
+
+
+        //计算每个点的残差
+        for(int i = 0; i < effect_feat_num_; i++)
         {
-            index[i] = i;
-            useful_ptpl[i] = false;
+            //取出匹配点
+            auto &ptpl = ptpl_list_[i];
+
+            //取出点云lidar下坐标
+            V3D point_this(ptpl.point_b);
+
+            //坐标系转换到imu机体系坐标
+            point_this = extR_ * point_this + extT_;
+
+            //点云雷达坐标系
+            V3D point_body(ptpl.point_b_);
+
+            //构造点的反对称矩阵
+            M3D point_crossmat;
+            point_crossmat << SKEW_SYM_MATRX(point_this);
+
+            //把机体坐标系下点转到世界坐标系下
+            V3D point_world = state_propagat.rot_end * point_this + state_propagat.pos_end;
+
+            //构造点到平面残差对平面参数的雅可比 J_nq，对应 r = n^T (p_w - q)
+            Eigen::Matrix<double, 1, 6> J_nq;
+            J_nq.block<1,3>(0,0) = point_world - ptpl_list_[i].center_;
+            J_nq.block<1,3>(0,3) = -ptpl_list_[i].normal_;
+
+            //把协方差传播到世界坐标系
+            M3D var;
+            var = state_propagat.rot_end * extR_ * ptpl_list_[i].body_cov_ * (state_propagat.rot_end * extR_).transpose();
+
+            // 计算残差方差 sigma_l，表示平面参数不确定性导致的点到平面残差方差
+            double sigma_l =J_nq * ptpl_list_[i].plane_var_ * J_nq.transpose();
+
+            // 计算残差权重 R_inv(i) ,点到平面残差的不确定性 =基础噪声+ 平面参数不确定性+ 点本身测量不确定性(点到平面距离只关心 沿平面法向量方向的误差)
+            R_inv(i) = 1.0 / (0.001 + sigma_l + ptpl_list_[i].normal_.transpose() * var * ptpl_list_[i].normal_)
+
+            //构建Husub,Husub_T_R_inv,meas_vec
+            //把每个点到平面的约束转换成 EKF 更新需要的线性形式：H * dx = meas_vec。
+            //A 是旋转雅可比，normal 是平移雅可比，R_inv 是残差权重，meas_vec 是希望被修正掉的点到平面距离。
+
+            V3D A(point_crossmat * state_.rot_end.transpose() * ptpl_list_[i].normal_);
+
+            //Hsub.row(i) 是第 i 个残差的雅可比,  H_i = [ 对旋转的导数, 对平移的导数 ]
+            Husub.row(i) << VEC_FROM_APPLY(A),  ptpl_list_[i].normal_[0],  ptpl_list_[i].normal_[1], ptpl_list_[i].normal_[2];
+
+            //Hsub_T_R_inv.col(i) 是加权后的 H 转置,在上面基础上都乘R_inv权重   
+            Husub_T_R_inv.col(i) << A[0] * R_inv(i), A(1) * R_inv(i), A(2) * R_inv(i), 
+                     ptpl_list_[i].normal_[0] * R_inv[i],
+                     ptpl_list_[i].normal_[1] * R_inv(i),
+                     ptpl_list_[i].normal_[2] * R_inv(i);
+
+            // 计算z - h(x)，z =0,  h(x) = r, 所以这里为负，实际测量值 - 预测测量值，如果当前状态很准，那么 h(x) 应该和 z 很接近，残差接近 0。
+            meas_vec(i) = -ptpl_list_[i].dis_to_plane_;
         }
 
-        #ifdef MP_EN
-         omp_set_num_threads(MP_PROC_NUM);
-         #pragma omp parallel for
-        #endif
+        //是否停止ekf迭代
+        EKF_stop_flg = false;
 
-        //遍历每个点云
-        for(int i = 0; i < index.size(); i++)
+        //当前迭代是否收敛
+        flg_EKF_converged = false;
+
+        //定义增益相关矩阵
+        MatrixXd k(DIM_STATE,effect_feat_num_);
+
+        //所有点到平面误差共同推动状态往哪个方向修正。HTz = H^T R^{-1} r
+        auto &&HTz = Husub_T_R_inv * meas_vec;
+
+        //点到平面约束对当前状态提供了多少信息。
+        H_T_H.block<6,6>(0,0) = Husub_T_R_inv * Hsub;
+
+        //K_1 = (H^T R^{-1} H + P^{-1})^{-1}，P^{-1} 表示先验约束，H^T R^{-1}H 表示当前点云量测约束，P^-1：IMU 传播先验约束。计算类似后验协方差的矩阵 K_1
+        MD(DIM_STATE,DIM_STATE) &&K_1 = (H_T_H.bolck<DIM_STATE, DIM_STATE>(0,0) + state_.cov.bolck<DIM_STATE,DIM_STATE>(0,0).inverse()).inverse();
+
+        //G = K_1 H^T R^{-1} H，这次量测对状态的“吸收比例”或者更新强度。
+        G.block<DIM_STATE,6>(0,0) = K_1.bolck<DIM_STATE,6> * H_T_H.block<6,6>(0,0);
+
+        //由于这是迭代 EKF，state_ 在每轮迭代中都会被更新，所以需要考虑当前迭代状态和传播先验状态之间的差异。
+        auto vec = state_propagat - state_;
+ 
+        // 求本轮 EKF 的状态修正量 solution，K_1 * HTz来自点到平面残差的修正量，+ vec把状态往传播先验拉回。- G * vec扣除量测已经解释掉的那部分先验差异。修正量既要让点云贴近地图平面，也不能完全偏离 IMU 传播先验。
+        VD(DIM_STATE)  
+            solution = K_1.bolck<DIM_STATE,6>(0,0) * HTz + vec.block<DIM_STATE, 1>(0,0) - G.block<DIM_STATE, 6>(0,0) * vec.block<6,1>(0,0);
+        int minRow, minCol;
+
+        //更新状态，把求出来的增量加到当前状态上。
+        state_ += solution;
+
+        //取旋转和平移增量用于收敛判断
+        auto rot_add = solution.block<3,1>(0,0);
+        auto t_add = solution.block<3,1>(3,0);
+
+        //rot_add.norm() 是弧度，乘 57.3 约等于转成角度。t_add.norm() 是米，乘 100 转成厘米。
+        //旋转增量小于0.01度，距离小于0.015厘米判定收敛
+        if((rot_add.norm() * 57.3 < 0.01) && (t_add.norm() * 100 < 0.015))
         {
-            //取出点云引用
-            pointWithVar &pv = pv_list[i];
-            float loc_xyz[3];
+            flg_EKF_converged = true;
+        } yaw, pitch, roll
 
-            //计算体素位置得到体素网格坐标
-            for(int j = 0; j < 3; j++)
+        //eulerAngles(2, 1, 0) 表示按：Z-Y-X（yaw, pitch, roll）
+        V3D euler_cur = state.rot_end.eulerAngles(2,1,0);
+
+        //状态更新以后，点的世界坐标会变，原来匹配的地图平面可能不是最优了。所以迭代过程中有时需要重新寻找对应平面，提高匹配质量。
+        //如果 EKF 已经收敛，则 rematch_num++,如果快到最大迭代次数了还没 rematch，也强制 rematch 一次
+        if(flg_EKF_converged || ((rematch_num == 0) && (iterCount == config_setting_.max_interations_ - 2)))
+        {
+            rematch_num++;
+        }
+
+        //停止ekf条件：已经 rematch 足够次数 或者 已经到最大迭代次数
+        if(!EKF_stop_flg && (rematch_num >= 2 || (iterCount == config_setting_.max_iterations_ - 1)))
+        {
+            //协方差更新
+            state_.cov.block<DIM_STATE,DIM_STATE>(0,0) = 
+              (I_STATE.block<DIM_STATE, DIM_STATE>(0,0) - G.block<DIM_STATE, DIM_STATE> * state_.cov.block<DIM_STATE, DIM_STATE>(0,0));
+
+              // 更新上一帧位置和四元数
+            position_last_ = state_.pos_end;
+            geoQuat_ = tf::createQuaternionMsgFromRollPitchYaw(euler_cur(2), euler_cur(1), euler_cur(0));
+
+            EKF_stop_flg = true;
+        }
+
+        if(EKF_stop_flg)
+        {
+            break;
+        }
+    }
+}
+
+//建立残差
+void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, std::vector<PointToPlane> &ptpl_list)
+{
+    //获取最大层数
+    int max_layer = config_setting.max_layer_;
+
+    //获取最大体素大小
+    double voxel_size = config_setting_.max_voxel_size_;
+
+    //标准差阈值
+    double sigma_num = config_setting_.sigma_num_;
+    std::mutex mylock();
+
+    //初始化输出结果
+    ptpl_list.clear();
+
+    //存储计算得到的残差
+    std::vector<PointToPlane> all_ptpl_list(pv_list.size());
+
+    //标记成功计算了残差的点
+    std::vector<bool> useful_ptpl(pv_list.size());
+
+    //记录点的索引
+    std::vector<size_t> index(pv_list.size());
+
+    //初始化有用点标记
+    for(size_t i = 0; i < index.size(); ++i)
+    {
+        index[i] = i;
+        useful_ptpl[i] = false;
+    }
+
+    #ifdef MP_EN
+        omp_set_num_threads(MP_PROC_NUM);
+        #pragma omp parallel for
+    #endif
+
+    //遍历每个点云
+    for(int i = 0; i < index.size(); i++)
+    {
+        //取出点云引用
+        pointWithVar &pv = pv_list[i];
+        float loc_xyz[3];
+
+        //计算体素位置得到体素网格坐标
+        for(int j = 0; j < 3; j++)
+        {
+            loc_xyz[j] = pv.point_w[i] / voxel_size;
+            if(loc_xyz[j] < 0) 
             {
-                loc_xyz[j] = pv.point_w[i] / voxel_size;
-                if(loc_xyz[j] < 0) 
+                loc_xyz[j] -= 1.0;
+            }
+        }
+
+        //构造体素
+        VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);
+
+        //在体素坐标中查找这个体素
+        auto iter = voxel_map_.find(position);
+
+
+        if(iter != voxel_map_.end())
+        {
+            //取出对应的八叉树
+            VoxelOctoTree *current_octo = iter->second;
+
+            //定义一个点到平面残差对象
+            PointToPlane single_ptpl;
+            
+            //定义一个是否成功标识
+            bool is_sucess = false;
+
+            //定义一个概率值
+            double prob = 0;
+
+            //构建残差
+            build_single_residual(pv, current_octo, 0, is_sucess, prob, single_ptpl);
+
+            //如果这个点的残差计算失败，尝试在邻近体素重新计算残差
+            if(!is_sucess)
+            {
+                //标记体素位置
+                VOXEL_LOCATION near_position = position;
+
+                if(loc_xyz[0] > (current_octo->voxel_center_[0] + current_octo->quater_length_))
                 {
-                    loc_xyz[j] -= 1.0;
+                    near_position.x = near_position + 1;
+                }
+                else if (loc_xyz[1] < (current_octo->voxel_center_[0] - current_octo->quater_length_))
+                {
+                    near_position.x = near_position - 1;
+                }
+
+                if(loc_xyz[0] > (current_octo->voxel_center_[1] + current_octo->quater_length_))
+                {
+                    near_position.y = near_position + 1;
+                }
+                else if (loc_xyz[1] < (current_octo->voxel_center_[1] - current_octo->quater_length_))
+                {
+                    near_position.y = near_position - 1;
+                }
+
+                if(loc_xyz[0] > (current_octo->voxel_center_[2] + current_octo->quater_length_))
+                {
+                    near_position.z = near_position + 1;
+                }
+                else if (loc_xyz[1] < (current_octo->voxel_center_[2] - current_octo->quater_length_))
+                {
+                    near_position.x = near_position - 1;
+                }
+
+                auto iter_near = voxel_map_.find(near_position);
+                if(iter_near != voxel_map_.end())
+                {
+                    build_single_residual(pv,iter_near->second, 0, is_sucess, prob, single_ptpl;)
                 }
             }
-
-            //构造体素
-            VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);
-
-            //在体素坐标中查找这个体素
-            auto iter = voxel_map_.find(position);
-
-
-            if(iter != voxel_map_.end())
+            if(is_sucess)
             {
-                //取出对应的八叉树
-                VoxelOctoTree *current_octo = iter->second;
-
-                //定义一个点到平面残差对象
-                PointToPlane single_ptpl;
+                mylock.lock();
+                useful_ptpl[i] = true;
+                all_ptpl_list[i] = single_ptpl;
+                mylock.unlock();
+            }
+            else
+            {
+                mylock.lock();
+                useful_ptpl[i] = false;
+                mylock.unlock();
                 
-                //定义一个是否成功标识
-                bool is_sucess = false;
-
-                //定义一个概率值
-                double prob = 0;
-
-                //构建残差
-                build_single_residual(pv, current_octo, 0, is_sucess, prob, single_ptpl);
-
-                //如果这个点的残差计算失败，尝试在邻近体素重新计算残差
-                if(!is_sucess)
-                {
-                    //标记体素位置
-                    VOXEL_LOCATION near_position = position;
-
-                    if(loc_xyz[0] > (current_octo->voxel_center_[0] + current_octo->quater_length_))
-                    {
-                        near_position.x = near_position + 1;
-                    }
-                    else if (loc_xyz[1] < (current_octo->voxel_center_[0] - current_octo->quater_length_))
-                    {
-                        near_position.x = near_position - 1;
-                    }
-
-                    if(loc_xyz[0] > (current_octo->voxel_center_[1] + current_octo->quater_length_))
-                    {
-                        near_position.y = near_position + 1;
-                    }
-                    else if (loc_xyz[1] < (current_octo->voxel_center_[1] - current_octo->quater_length_))
-                    {
-                        near_position.y = near_position - 1;
-                    }
-  
-                    if(loc_xyz[0] > (current_octo->voxel_center_[2] + current_octo->quater_length_))
-                    {
-                        near_position.z = near_position + 1;
-                    }
-                    else if (loc_xyz[1] < (current_octo->voxel_center_[2] - current_octo->quater_length_))
-                    {
-                        near_position.x = near_position - 1;
-                    }
-
-                    auto iter_near = voxel_map_.find(near_position);
-                    if(iter_near != voxel_map_.end())
-                    {
-                        build_single_residual(pv,iter_near->second, 0, is_sucess, prob, single_ptpl;)
-                    }
-                }
-                if(is_sucess)
-                {
-                    mylock.lock();
-                    useful_ptpl[i] = true;
-                    all_ptpl_list[i] = single_ptpl;
-                    mylock.unlock();
-                }
-                else
-                {
-                    mylock.lock();
-                    useful_ptpl[i] = false;
-                    mylock.unlock();
-                    
-                }
             }
         }
-        for(size_t i = 0; i < useful_ptpl.size(); i++)
+    }
+    for(size_t i = 0; i < useful_ptpl.size(); i++)
+    {
+        ////在并行部分结束后，将 所有成功计算的 PointToPlane 结果 存入 ptpl_list
+        if(useful_ptpl[i])
         {
-            ////在并行部分结束后，将 所有成功计算的 PointToPlane 结果 存入 ptpl_list
-            if(useful_ptpl[i])
-            {
-                ptpl_list.push_back(all_ptpl_list[i]);
-            }
+            ptpl_list.push_back(all_ptpl_list[i]);
         }
-
     }
 
-    //该函数用于计算给单个定点 pv 相对于 当前体素 current_octo 的点到平面（Point-to-Plane）残差，并更新 single_ptpl 结构
-    void VoxelMapManager::build_single_residual(pointwithvar &pv, const VoxelOctoTree *current_octo, const int current_layer, bool &is_sucess, double &prob, PointToPlane &single_ptpl)
+}
+
+//该函数用于计算给单个定点 pv 相对于 当前体素 current_octo 的点到平面（Point-to-Plane）残差，并更新 single_ptpl 结构
+void VoxelMapManager::build_single_residual(pointwithvar &pv, const VoxelOctoTree *current_octo, const int current_layer, bool &is_sucess, double &prob, PointToPlane &single_ptpl)
+{
+    //最大层数
+    int max_layer = config_setting.max_layer;
+
+    //标准差权重
+    double sigma_num = config_setting.sigma_num_;
+
+    //范围判定因子
+    double radius_ = 3;
+
+    //世界坐标系点转为向量形式
+    Eigen::Vector3d p_w = pv.point_w;
+
+    //当前八叉树是否是平面
+    if(current_octo->plane_ptr_->is_plane_)
     {
-        //最大层数
-        int max_layer = config_setting.max_layer;
+        //取出当前平面
+        Voxelplane &plane = *current_octo->plane_ptr_;
 
-        //标准差权重
-        double sigma_num = config_setting.sigma_num_;
+        //当前点到平面中心差
+        Eigen::Vector3d p_world_to_center = p_w - plane.center_;
 
-        //范围判定因子
-        double radius_ = 3;
+        //计算点到平面的距离
+        float dis_to_plane_ = fabs(plane.normal_(0) * p_w(0) + plane.normal_(1) * p_w(1) + plane.normal_(2) * p_w(2) + plane.d_);
 
-        //世界坐标系点转为向量形式
-        Eigen::Vector3d p_w = pv.point_w;
+        //点到平面中心的距离
+        float dis_to_center = (plane.center_(0) - p_w(0) )  * (plane.center_(0) - p_w(0)) + (plane.center_(1) - p_w(1)) * (plane.center_(1) - p_w(1)) + (plane.center_(2) - p_w(2)) * ( plane.center_(2) - p_w(2));
 
-        //当前八叉树是否是平面
-        if(current_octo->plane_ptr_->is_plane_)
+        //计算点到平面中心的投影半径，根据勾股定理，点到平面中心和点到平面距离
+        float range_dis = sqrt(dis_to_center - dis_to_plane_ * dis_to_plane_);
+
+        //判断投影半径是否在平面允许的范围内， radius_k是放大系数
+        if(range_dis <= radius_k * plane.radius_)
         {
-            //取出当前平面
-            Voxelplane &plane = *current_octo->plane_ptr_;
+            //构造 点到平面残差对平面参数的雅可比矩阵，残差r = n^T (p - q)，J_nq = ∂r / ∂[n, q]
+            Eigen::Matrix<double,1,6> J_nq;
 
-            //当前点到平面中心差
-            Eigen::Vector3d p_world_to_center = p_w - plane.center_;
+            //对法向量 normal 的导数，残差对法向量的敏感程度
+            J_nq.block<1,3>(0,0) = p_w - plane.center_;
 
-            //计算点到平面的距离
-            float dis_to_plane_ = fabs(plane.normal_(0) * p_w(0) + plane.normal_(1) * p_w(1) + plane.normal_(2) * p_w(2) + plane.d_);
+            //对平面中心 center 的导数
+            J_nq.block<1,3>(0,3) = -plane.normal_;
 
-            //点到平面中心的距离
-            float dis_to_center = (plane.center_(0) - p_w(0) )  * (plane.center_(0) - p_w(0)) + (plane.center_(1) - p_w(1)) * (plane.center_(1) - p_w(1)) + (plane.center_(2) - p_w(2)) * ( plane.center_(2) - p_w(2));
+            //点到平面残差由于平面不确定性带来的方差，可以用误差传播：
+            double sigma_l = J_nq * plane.plane_var_ * J_nq.transpose();
 
-            //计算点到平面中心的投影半径，根据勾股定理，点到平面中心和点到平面距离
-            float range_dis = sqrt(dis_to_center - dis_to_plane_ * dis_to_plane_);
-
-            //判断投影半径是否在平面允许的范围内， radius_k是放大系数
-            if(range_dis <= radius_k * plane.radius_)
+            //如果点到平面的距离小于若干倍标准差，就认为这个点和平面匹配。
+            if(dis_to_plane < sigma_num * sqrt(sigma_l))
             {
-                //构造 点到平面残差对平面参数的雅可比矩阵，残差r = n^T (p - q)，J_nq = ∂r / ∂[n, q]
-                Eigen::Matrix<double,1,6> J_nq;
+                //标记找到一个可以匹配的平面
+                is_sucess = true;
 
-                //对法向量 normal 的导数，残差对法向量的敏感程度
-                J_nq.block<1,3>(0,0) = p_w - plane.center_;
+                //根据点到平面距离和残差方差，计算当前匹配的概率/评分。   标准高斯概率形式 prob ∝ exp(-0.5 * d² / σ²) / sqrt(σ²)
+                double this_prob = 1.0 / (sqrt(sigma_l)) * exp(-0.5 * dis_to_plane * dis_to_plane / sigma_l);
 
-                //对平面中心 center 的导数
-                J_nq.block<1,3>(0,3) = -plane.normal_;
+                // 选择最优平面
+                if(this_prob > prob)
+                
+                    //保存当前最优匹配
+                    prob = this_prob;
 
-                //点到平面残差由于平面不确定性带来的方差，可以用误差传播：
-                double sigma_l = J_nq * plane.plane_var_ * J_nq.transpose();
+                    //保存平面法向量到点结构
+                    pv.normal = plane.normal_;
 
-                //如果点到平面的距离小于若干倍标准差，就认为这个点和平面匹配。
-                if(dis_to_plane < sigma_num * sqrt(sigma_l))
-                {
-                    //标记找到一个可以匹配的平面
-                    is_sucess = true;
+                    //保存点的机体系协方差  
+                    single_ptpl.body_cov_ = pv.body_var;
 
-                    //根据点到平面距离和残差方差，计算当前匹配的概率/评分。   标准高斯概率形式 prob ∝ exp(-0.5 * d² / σ²) / sqrt(σ²)
-                    double this_prob = 1.0 / (sqrt(sigma_l)) * exp(-0.5 * dis_to_plane * dis_to_plane / sigma_l);
+                    //保存点在 body 系和 world 系下的位置
+                    single_ptpl.point_b = pv.point_b;
+                    single_ptpl.point_w = pv.point_w;
 
-                    // 选择最优平面
-                    if(this_prob > prob)
+                    //保存平面参数协方差
+                    single_ptpl.plane_var_ = plane.plane_var_;
                     
-                        //保存当前最优匹配
-                        prob = this_prob;
+                    //保存平面法向量和中心
+                    single_ptpl.normal_ = plane.normal_;
+                    single_ptpl.center_ = plane.center_;
 
-                        //保存平面法向量到点结构
-                        pv.normal = plane.normal_;
+                    //保存平面方程参数 d
+                    single_ptpl.d_ = plane.d_;
 
-                        //保存点的机体系协方差  
-                        single_ptpl.body_cov_ = pv.body_var;
+                    //保存当前平面所在层级
+                    single_ptpl.layer_ = current_layer;
 
-                        //保存点在 body 系和 world 系下的位置
-                        single_ptpl.point_b = pv.point_b;
-                        single_ptpl.point_w = pv.point_w;
+                    //保存最终点到平面距离
+                    single_ptpl.dis_to_plane_ = plane.normal_(0) * p_w(0) + plane.normal_(1) * p_w(1) + plane.normal_(2) * p_w(2) + plane.d_;
+                }
 
-                        //保存平面参数协方差
-                        single_ptpl.plane_var_ = plane.plane_var_;
-                        
-                        //保存平面法向量和中心
-                        single_ptpl.normal_ = plane.normal_;
-                        single_ptpl.center_ = plane.center_;
-
-                        //保存平面方程参数 d
-                        single_ptpl.d_ = plane.d_;
-
-                        //保存当前平面所在层级
-                        single_ptpl.layer_ = current_layer;
-
-                        //保存最终点到平面距离
-                        single_ptpl.dis_to_plane_ = plane.normal_(0) * p_w(0) + plane.normal_(1) * p_w(1) + plane.normal_(2) * p_w(2) + plane.d_;
-                    }
-
-            }
-
-            return;
         }
+
+        return;
+    }
+    else
+    {
+        ////递归搜索八叉树的子节点，直到达到 max_layer
+        if(current_layer < max_layer)
+        {
+            for(size_t leafnum = 0; leafnum < 8; leafnum++)
+            {
+                if(current_octo->leaves_[leafnum] != nullptr)
+                {
+                    VoxelOctoTree *leaf_octo = current_octo->leaves_[leafnum];
+                    build_single_residual(pv, leaf_octo, current_layer + 1, is_sucess, prob, single_ptpl);
+                }
+            }
+        
+        } 
+        return；   
+    }
+
+}
+
+//初始时创建体素地图使用
+void VoxelMapManager::buildVoxelMap()
+{
+
+    //读取lio参数配置
+    float voxel_size = config_setting_.max_voxel_size_;
+    float planer_threshold = config_setting_.planner_threshold_;
+    int max_layer = config_setting.max_layer_;
+    int max_points_num = config_setting.max_points_num_;
+    std::vector<int> layer_init_num = config_setting_.layer_init_num_;
+
+    //创建临时输入点云
+    std::vector<pointwithvar> input_point;
+
+    //遍历当前帧降采样点云
+    for(size_t i = 0; i < feats_down_world_->size(); i++)
+    {
+        //创建带协方差等信息点云变量
+        pointwithvar pv;
+
+        //存入世界坐标点云
+        pv.point_w << feats_down_world_->points[i].x, feats_down_world_->points[i].y, feats_down_world_->points[i].z;
+
+        //存入雷达坐标系点云
+        V3D point_this(feats_down_body_->points[i].x, feats_down_body_->points[i].y, feats_down_body_->points[i].z);
+        
+        //计算自身协方差
+        M3D var;
+        calcBodyCov(point_this, config_setting.dept_err_, config_setting_.beam_err_, var);
+
+        //存入该点云的反对称矩阵
+        M3D point_crossmat;
+        point_crossmat << SKEW_SYM_MATRX(point_this);
+
+        //协方差传播到世界坐标系
+        var = (state_.rot_end * ectR_) * var * (state.rot_end * extR_).transpose() + (-point_crossmat) * state_.cov_block<3,3>(0,0) * (-point_crossmat.transpose() + state_.cov.block<3,3>(3,3));
+ 
+        //存入协方差和该点
+        pv.var = var;
+        int_points.push_back(pv);
+    }
+
+    //计算输入点云数
+    uint plsize = input_points.size();
+
+    //遍历带协方差点
+    for(uint i = 0; i < plsize; i++)
+    {
+        //获取点云
+        const pointwithvar &p_v = input_points[i];
+
+        //计算该点云整数体素坐标
+        float loc_xyz[3];
+        for(int j = 0; j < 3; j++)
+        {
+            loc_xyz[j] = p_v.point_w[j] / voxel_size;
+            if(loc_xyz[j] < 0)
+            {
+                loc_xyz[j] -= 1.0;
+            }
+        }
+
+        //创建体素坐标位置索引
+        VOXEL_LOCATION position( (int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);
+
+        //在体素地图寻找该体素
+        auto iter = voxel_map_.find(position);
+
+        //存在则加入点云
+        if(iter != voxel_map_.end())
+        {
+            //这里把点加入该 voxel 对应八叉树的临时点容器：
+            voxel_map_[position]->temp_points_.push_back(p_v);
+            voxel_map_[position]->new_points_++;
+        }
+        //不存在则创建
         else
         {
-            ////递归搜索八叉树的子节点，直到达到 max_layer
-            if(current_layer < max_layer)
-            {
-                for(size_t leafnum = 0; leafnum < 8; leafnum++)
-                {
-                    if(current_octo->leaves_[leafnum] != nullptr)
-                    {
-                        VoxelOctoTree *leaf_octo = current_octo->leaves_[leafnum];
-                        build_single_residual(pv, leaf_octo, current_layer + 1, is_sucess, prob, single_ptpl);
-                    }
-                }
-            
-            } 
-            return；   
+            VoxelOctoTree *octo_tree = new VoxelOctoTree(max_layer, 0, layer_init_num[0], max_points_num, planer_threshold);
+            voxel_map_[position] = octo_tree;
+            voxel_map_[position]->quater_length_ = voxel_size / 4;
+            voxel_map_[position]->voxel_center_[0] = (0.5 + position.x) * voxel_size;
+            voxel_map_[position]->voxel_center_[1] = (0.5 + position.y) * voxel_size;
+            voxel_map_[position]->voxel_center_[2] = (0.5 + position.z) * voxel_size;
+            voxel_map_[position]->temp_points_.push_back(p_v);
+            voxel_map_[position]->new_points_++;
+            voxel_map_[position]->layer_init_num_ = layer_init_num;
         }
+        
 
     }
+
+    //先把点分配到体素，然后对每个体素初始化八叉树结构
+    for(auto iter = voxel_map_.begin(); iter != voxel_map_.end(); ++iter)
+    {
+        iter->second->init_octo_tree();
+    }
+
+}
+
+//后续新输入帧更新地图
+void VoxelMapManager::UpdateVoxelMap(const std::vector<pointwithvar> &input_points)
+{
+
+    //读取地图配置
+    float voxel_size = config_setting_.max_voxel_size_;
+    float planer_threshold = config_setting_.planer_threshold_;
+    int max_layer = config_setting_.max_layer_;
+    int max_points_num = config_setting_.max_points_num_;
+    std::vector<int> layer_init_num = config_setting_.layer_init_num_;
+
+    //遍历输入点
+    uint plsize = input_points.size();
+
+    for(uint i = 0; i < plsize; i++)
+    {
+        //根据世界坐标计算 voxel 索引
+        const pointwithvar &pv = input_points[i];
+        float loc_xyz[3];
+        for(int j = 0; j < 3; j++)
+        {
+            loc_xyz[j] = p_v.point_w[j] / voxel_size;
+            if(loc_xyz[j] < 0)
+            {
+                loc_xyz[j] -= 1.0
+            }
+        }
+
+        //创建 voxel 索引
+        VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2])
+        auto iter = voxel_map_.find(position);
+
+        //这个点所在的 voxel 已经有八叉树了，
+        if(iter != voxel_map_.end())
+        {
+            //所以直接把这个点插入已有八叉树并更新。
+            voxel_map_[position]->updateOctoTree(p_v);
+        }
+        //如果 voxel 不存在
+        else
+        {
+            //设置新 voxel 的参数
+            VoxelOctoTree *octo_tree = new VoxelOctoTree(max_layer, 0, layer_init_num[0], max_points_num, planer_threshold);
+            voxel_map_[position] = octo_tree;
+            voxel_map_[position]->layer_init_num_ = layer_init_num;
+            voxel_map_[position]->quater_length_ = voxel_size / 4;
+            voxel_map_[position]->voxel_center_[0] = (0.5 + position.x) * voxel_size;
+            voxel_map_[position]->voxel_center_[0] = (0.5 + position.y) * voxel_size;
+            voxel_map_[position]->voxel_center_[0] = (0.5 + position.z) * voxel_size;
+
+            //把点插入新 octree
+            voxel_map_[position]->updateOctoTree(p_v);
+        }
+    }
+}

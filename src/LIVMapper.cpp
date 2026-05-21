@@ -15,7 +15,10 @@ LIVMapper = 系统主控类
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <complex>
 #include <cstddef>
+#include <fstream>
+#include <omp.h>
 #include <pthread.h>
 #include <random>
 
@@ -878,10 +881,157 @@ void LIVMapper::handleLIO()
     {
         lidar_map_inited = true;
         voxelmap_manage->buildVoxelMap();
+    }
 
+    double t1 = omp_get_wtime();
+
+    //进行状态估计
+    voxelmap_manager->StateEstimation(state_propagat);
+
+    //把 EKF 更新后的状态保存到主流程的 _state。
+    _state = voxelmap_manager->state_;
+
+    //当前帧带协方差的点列表
+    _pv_list = voxelmap_manager->pv_list_;
+
+    double t2 = omp_get_wtime();
+
+    // 如果开启 IMU propagation，同步最新 EKF 状态
+    if(imu_prop_enable)
+    {
+        //EKF 至少已经完成过一次 LiDAR 更新。
+        ekf_finish_once = true;
+
+        //保存最新一次 EKF 后的状态。
+        lastest_ekf_state = _state;
+
+        //保存这次 EKF 状态对应的时间戳。
+        lastest_ekf_time = LidarMeasures.last_lio_update_time;
+
+        //更新标识
+        state_update_flg = true;
+    }
+
+    //如果开启轨迹输出，保存 TUM 格式轨迹，把估计轨迹写入文本文件，timestamp tx ty tz qx qy qz qw
+    if(pose_output_en)
+    {
+        static bool pos_opend = false;
+        static int ocount = 0;
+        static std::ofstream outFile;
+
+        std::string file_path = std::string(ROOT_DIR) + "Log/result/" + seq_name + ".txt";
+        //第一次进入，重新写一个干净的轨迹
+        if(!pos_opend)
+        {
+
+            //std::ios::out 会创建新文件，或者清空已有文件。
+            outFile.open(file_path, std::ios::out);
+            pos_opend = true;
+            if(!outFile.is_open())
+            {
+                ROS_ERROR("open fail\n");
+                return;
+            }
+
+            outFile << std::fixed;  //这句设置输出格式为固定小数形式。evoFile << std::fixed << std::setprecision(6);控制精度
+
+        }
+
+        if (!outFile.is_open())
+        {
+            ROS_ERROR("trajectory file is not open\n");
+            return;
+        }
+
+        // 生成位姿四元数
+        Eigen::Quaterniond q(_state.rot_end);
+        //是为了保证输出的四元数是合法的单位四元数，避免由于浮点误差导致轨迹文件出现异常。
+        q.std::normalize();
+
+        outFile << LidarMeasures.last_lio_update_time << " " << _state.pos_end[0] << " " << _state.pos_end[1] << " "
+                << _state.pos_end[2] << " " << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << " " << ocount <<std::endl;
+        ocount++;
+    }
+
+    //1. 姿态转欧拉角，再转四元数发布
+    euler_cur = RotMtoEuler(_state.rot_end);
+    geoQuat = tf::createQuaternionMsgFromRollPitchYaw(euler_cur(2), euler_cur(1), euler_cur(0));
+    publish_odometry(pubOdometryAftMapped);
+
+    double t3 = omp_get_wtime();
+
+    //这里创建一个新的点云指针，用来保存转换到世界坐标系下的当前帧点云
+    PointCloudXYZI::Ptr world_lidar(new PointCloudXYZI());
+
+    //在状态估计完成后，用最新位姿重新计算当前帧点云的世界坐标和世界系协方差
+    transformLidar(_state.rot_end, _state.pos_end, feats_down_body, world_lidar);
+
+    //遍历世界系点云，更新 pv_list_ 里的点坐标和协方差,
+    for(size_t i = 0; i < world_lidar->points.size(); i++)
+    {
+        //把刚刚转换出来的世界系点坐标，写回 pv_list_[i].point_w
+        VoxelMap_Manager->pv_list_[i].point_w << world_lidar->points[i].x, world_lidar->points[i].y, world_lidar->points[i].z;
+
+        //取出点的叉乘矩阵和 body 系协方差
+        M3D point_crossmat = VoxelMap_Manager->cross_mat_list_[i];
+        M3D var = voxelmap_manager->body_cov_list_[i];
+
+        //重新计算点在 world 系下的总协方差
+        var = (_state.rot_end * extR) * var * (_state.rot_end * extR).transpose() + 
+              (-point_crossmat) * _state.cov.block<3,3>(0,0) * (-point_crossmat).transpose() + _state.cov.bolck<3,3>(3,3);
+
+        //最后把计算好的世界系点协方差保存到 pv_list_[i].var
+        voxelmap_manager->pv_list_[i].var = var;
     }
 
 
+    // 插入当前帧点云到地图
+    voxelmap_manager->UpdateVoxelMap(voxelmap_manager->pv_list);
+    std::cout <<"[ LIO ] update Voxel map" << std::endl;
+
+    //把 voxelmap_manager 内部当前帧的带协方差点列表 pv_list_，拷贝一份到外部变量 _pv_list。
+    _pv_list = voxelmap_manager->pv_list_;
+
+    double t4 = omp_get_wtime();
+
+    if(voxelmap_manager->config_setting_.map_sliding_en)
+    {
+        voxelmap_manager->mapSliding();
+    }
+
+    //根据配置选择使用去畸变后的点云还是降采样后的点云
+    PointCloudXYZI::Ptr laserCloudFullRes(dense_map_en ? feats_undistort : feats_down_body);
+    int size = laserCloudFullRes->points.size();
+    PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
+
+    //将lidar坐标系点云转换为世界坐标系点云
+    for(int i = 0; i < size; i++)
+    {
+        RGBpointBodyToWorld(&laserCloudFullRes->points[i], &laserCloudWorld->points[i]);
+    }
+
+    *pcl_w_wait_pub = *laserCloudWorld;
+
+
+    //pubLaserCloudFullRes是点云发布器
+    publish_frame_world(pubLaserCloudFullRes, VIOManager);
+
+
+    if(publish_effect_point_en) 
+    {
+        publish_effect_world(pubLaserCloudEffect, voxelmap_manager->ptpl_list_);
+    }
+
+    if(voxelmap_manager->config_setting.is_pub_plane_map_) 
+    {
+        voxelmap_manager->pubVoxelMap();
+    }
+    publish_path(pubPath);
+    
+    euler_cur = RotMtoEuler(_state.rot_end);
+    fout_out << std::setw(20) << LidarMeasures.l ast_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 <<" " 
+            <<_state.pos_end.transpose() << " " <<_state.vel_end.transpose() << " " << _state.bais_g.transpose() << " " 
+            <<_state.bais_a.transpose() << " " << V3D(_state.inv_expo_time,0,0).transpose() <<" " << feats_undistort->points.size() <<std::endl;
 
 }
 
@@ -919,6 +1069,53 @@ void LIVMapper::handleVIO();
 
 
 
+}
+
+
+
+//保存地图
+void LIVMapper::savePCD()
+{
+    if(pcd_save_en && (pcl_wait_save->points.size() > 0 || pcl_wait_save_intensity->points.size() > 0) && pcd_save_interval < 0)
+    {
+        std::sting raw_point_dir = std::string(ROOT_DIR) + "Log/PCD/all_raw_points.pcd";
+
+        std::string downsampled_point_dir = std::string(ROOT_DIR) + "Log/PCD/all_downsampled_points.pcd";
+
+        pcl::PCDWriter pcd_writer;
+
+        if(img_en)
+        {
+            pcl::PointCloud<pcl::PointXYZRGB>::Ptr downsampled_cloud(new pcl::PointCloud<pcl::PointCloud<pcl::PointXYZRGB>)
+
+        }
+        else
+        {
+
+        }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    }
 }
 
 //标准点云回调处理
@@ -1463,3 +1660,16 @@ void LIVMapper::publish_path(const ros::publish pubpath)
     //发布
     pubPath.publish(path);
 }
+
+
+//把一个点从 LiDAR/body 坐标系 转换到 世界坐标系，同时保留点的强度 intensity。
+void LIVMapper::RGBpointBodyToWorld(PointType const *const pi, PointType *const po)
+{
+    V3D p_body(pi->x, pi->y, pi->z);
+    V3D p_global(_state.rot_end * (extR * p_body + extT) + _state.pos_end);
+    po->x = p_global(0);
+    po->y = p_global(1);
+    po->z = p_global(2);
+    po->intensity = pi->intensity;
+}
+
